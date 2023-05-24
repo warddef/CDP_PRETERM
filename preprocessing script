@@ -1,0 +1,233 @@
+#!/bin/bash
+set -e  # stop on error
+
+# Ward Deferm
+# Center for Developmental Psychiatry, KU Leuven
+# for questions defermw@gmail.com or ward.deferm@student.kuleuven.be
+# 08/03/2023
+
+#the basis from the script was taken from the tractseg resources folder, but the script has been heavily editted to form a whole pipeline for the data of our study
+
+#######################################################################################################################
+#
+# It does the following steps:
+#
+# 1. Denoising
+# 2. Remove Gibbs Ringing Artifacts
+# 3. Remove Eddy Currents and head motion
+# 4. Perform B1 field inhomogeneity correction
+# 5. Create brain mask
+# 6. Rigidly align to MNI space
+# 7. Extract FODs and peaks
+# 8. Run TractSeg
+# 9. Fit tensor model
+# 10. Perform tractometry
+#
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#
+# IMPORTANT: Look for all "todo" comments and adapt those parts according to your data.
+#
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#######################################################################################################################
+
+function eddy_correct_extract_mask_denoise() {
+    cd $data_path/$1
+    
+#todo before starting this step make sure apply_brainmaks.py is in the folder of every participant.
+# correct for 
+    echo "Denoising..."
+    dwidenoise front.nii Diffusion_denoise.nii.gz -noise noise.nii.gz -extent 7 -force 
+    cp -v front.bvec Diffusion_denoise.bvecs
+    cp -v front.bval Diffusion_denoise.bvals
+    mrcalc front.nii Diffusion_denoise.nii.gz -subtract noise_residual.nii.gz
+
+    echo "Unringing..."
+    mrdegibbs Diffusion_denoise.nii.gz Diffusion_denoise_unr.nii.gz -axes 0,1 -force 
+    cp -v Diffusion_denoise.bvals Diffusion_denoise_unr.bvals
+    cp -v Diffusion_denoise.bvecs Diffusion_denoise_unr.bvecs
+    
+    echo "preparing reverse data for topup/eddy"
+    #code edited from https://github.com/andrewjahn/AndysBrainBook/blob/master/docs/MRtrix/MRtrix_Course/MRtrix_04_Preprocessing.rst
+    #since our data has a frontal and reverse sequences with AP and PA gradients we can use rpe_pair to correct for B0 inhomogenities
+    
+    mrconvert reverse.nii reverse.mif
+
+    mrconvert reverse.mif -fslgrad reverse.bvec reverse.bval - | mrmath - mean mean_b0_PA.mif -axis 3
+
+    dwiextract front.nii - -bzero -fslgrad front.bvec front.bval | mrmath - mean mean_b0_AP.nii -axis 3 
+mrcat mean_b0_AP.nii mean_b0_PA.mif -axis 3 b0_pair.nii
+    
+    echo "Eddy..."
+    #todo: adapt -pe_dir parameter according to the way your data was acquired
+  
+
+    #orignal dwiprepoc from this script was not used anymore it is replaced by dwifslprepoc, for more info about the comment see 
+   
+    #https://mrtrix.readthedocs.io/en/3.0.3/dwi_preprocessing/dwifslpreproc.html
+    
+
+    dwifslpreproc Diffusion_denoise_unr.nii.gz Diffusion_denoise_unr_eddy.nii.gz -rpe_pair -se_epi b0_pair.nii -pe_dir AP -force \
+-fslgrad Diffusion_denoise_unr.bvecs Diffusion_denoise_unr.bvals \
+    -eddyqc_text eddyqc
+    cp -v Diffusion_denoise_unr.bvecs Diffusion_denoise_unr_eddy.bvecs
+    cp -v Diffusion_denoise_unr.bvals Diffusion_denoise_unr_eddy.bvals
+
+    #piece of code to call the path to ANTS, neceeassary to get to the bin file for N4bias correction
+    #todo replace this with the path on your pc
+
+   export ANTSPATH=/Users/r0755008/build/build/install/bin/
+   export PATH=${ANTSPATH}:$PATH
+
+    echo "Bias correcting..."  # ants strongly recommended over fsl
+    dwibiascorrect ants Diffusion_denoise_unr_eddy.nii.gz Diffusion_denoise_unr_eddy_bias.nii.gz -bias bias_field.nii.gz -force \
+    -fslgrad Diffusion_denoise_unr_eddy.bvecs Diffusion_denoise_unr_eddy.bvals -force
+    cp -v Diffusion_denoise_unr_eddy.bvals Diffusion_denoise_unr_eddy_bias.bvals
+    cp -v Diffusion_denoise_unr_eddy.bvecs Diffusion_denoise_unr_eddy_bias.bvecs
+
+    echo "create files for TRACULA" #creates files that can be used for the input of tracula, the rest keeps on preprocessing for further use in tractseg. 
+    cp -v Diffusion_denoise_unr_eddy_bias.bvals tracula.bvals
+    cp -v Diffusion_denoise_unr_eddy_bias.bvecs tracula.bvecs
+    cp -v Diffusion_denoise_unr_eddy_bias.nii.gz tracula.nii.gz
+    
+
+    echo "Brain masking..."
+    #todo: if brain masks are too big or too small: adjust -f parameter (range: 0.1-0.5)
+    bet Diffusion_denoise_unr_eddy_bias nodif_brain_mask.nii.gz -f 0.3 -g 0 -m
+    rm nodif_brain_mask.nii.gz      #only b0 not all gradients
+    mv nodif_brain_mask_mask.nii.gz nodif_brain_mask.nii.gz
+
+    python apply_brain_mask.py Diffusion_denoise_unr_eddy_bias.nii.gz \
+    Diffusion_denoise_unr_eddy_bias_brain.nii.gz nodif_brain_mask.nii.gz
+    cp -v Diffusion_denoise_unr_eddy_bias.bvals Diffusion_denoise_unr_eddy_bias_brain.bvals
+    cp -v Diffusion_denoise_unr_eddy_bias.bvecs Diffusion_denoise_unr_eddy_bias_brain.bvecs
+}
+
+function  register_DWI_to_MNI() {
+    cd $data_path/$1
+    export FSLPARALLEL=1
+    
+   
+    echo "Registering to MNI..."
+   
+    #Register DWI to MNI,
+#todo replace init if needed for your own study.
+flirt -ref /Users/r0755008/miniconda3/lib/python3.9/site-packages/tractseg/resources/MNI_FA_template.nii.gz -in Diffusion_denoise_unr_eddy_bias_brain.nii.gz \
+-out Diffusion_denoise_unr_eddy_bias_brain_MNI.nii.gz -applyxfm -init /Users/r0755008/Desktop/Struc_DTI_ASD/transformation_matrice.mat -dof 6 -interp spline
+
+    cp -v Diffusion_denoise_unr_eddy_bias_brain.bvals   Diffusion_denoise_unr_eddy_bias_brain_MNI.bvals
+    rotate_bvecs -i Diffusion_denoise_unr_eddy_bias_brain.bvecs -t /Users/r0755008/Desktop/Struc_DTI_ASD/transformation_matrice.mat -o Diffusion_denoise_unr_eddy_bias_brain_MNI.bvecs
+
+
+    #Remove negative values (introduced by spline interpolation)
+    # if this does not work change upper line in python script 
+    remove_negative_values Diffusion_denoise_unr_eddy_bias_brain_MNI.nii.gz \
+    Diffusion_denoise_unr_eddy_bias_brain_MNI.nii.gz  # remove_negative_values is part of TractSeg
+
+    #Get final files (just makes a copy and renames them, the pp referes to preprocessed data)
+    cp -v Diffusion_denoise_unr_eddy_bias_brain_MNI.bvals frontpp.bval
+    cp -v Diffusion_denoise_unr_eddy_bias_brain_MNI.bvecs frontpp.bvec
+    cp -v Diffusion_denoise_unr_eddy_bias_brain_MNI.nii.gz frontpp.nii.gz
+    rm nodif_brain_mask.nii.gz
+
+}
+
+
+
+
+function run_TractSeg() {
+    echo "Running TractSeg..."
+    cd $data_path/$1
+						#the next 2 lines of code are necessary to use the correct version of pyhton for tractseg, since it only works on 3.7
+						#note to self if able to change bash profile then remove these lines of code. 
+    pyenv global 3.7
+    eval "$(pyenv init --path)"
+    
+    
+    echo "bundle segmentation"
+    TractSeg -i frontpp.nii.gz --bvals frontpp.bval --bvecs frontpp.bvec --raw_diffusion_input  --keep_intermediate_files
+    echo "ending segmentation"
+    TractSeg -i tractseg_output/peaks.nii.gz -o tractseg_output --output_type endings_segmentation
+    echo "TOM"
+    TractSeg -i tractseg_output/peaks.nii.gz -o tractseg_output --output_type TOM
+    echo "tracking"
+    Tracking -i tractseg_output/peaks.nii.gz -o tractseg_output --nr_fibers 5000
+     
+    
+}
+
+function dti(){ 
+cd $data_path/$1
+
+echo "fitting tensor model"
+
+dtifit -k frontpp.nii -o dti -m tractseg_output/nodif_brain_mask.nii.gz -r frontpp.bvec -b frontpp.bval
+
+}
+
+function tractometry(){
+cd $data_path/$1
+
+    pyenv global 3.7
+    eval "$(pyenv init --path)"
+
+echo "running tractometry"
+
+cd tractseg_output
+Tractometry -i TOM_trackings/ -o tractometry.csv -e endings_segmentations/ -s $data_path/$1/dti_FA.nii.gz
+
+}
+
+#todo comment out which part of the pipeline you want to run, i would recommend to do the preprocessing and the tractseg seperatly.
+ preprocessing_pipeline() {
+    #eddy_correct_extract_mask_denoise $1
+    #register_DWI_to_MNI $1
+    run_TractSeg $1
+    dti $1
+    tractometry $1
+}
+
+
+################################# PLOT RESULTS
+#todo code for visualizing the results after the script has been completed. comment out to run script otherwise get error
+#to plot either the FA value or pval in 3D add --plot3D pval or metric to the code as you can see for one example
+#todo to adjust the axis of your figures or the legend or your group, or how to visualze the p values (simple vs detailled) go to /Users/r0755008/.pyenv/versions/3.7.16/bin/plot_tractometry_results, look for the todo comments and change this before running the code 
+
+#todo be sure to paste these python commands in the bash shell aswell otherwise the plotting code will not work 
+
+#for furter info about the plotting commands see https://github.com/MIC-DKFZ/TractSeg/blob/master/resources/Tractometry_documentation.md
+
+#pyenv global 3.7
+#eval "$(pyenv init --path)"
+#plot tractometry results can be found at /Users/r0755008/.pyenv/versions/3.7.16/bin/plot_tractometry_results, change the paramters for the plots according to your study see todo comments inside
+
+#plot_tractometry_results -i /Users/r0755008/Desktop/mri_data/DIFFUSION/subjects.txt -o tractometry_result.png --plot3D pval 
+
+#plot_tractometry_results -i /Users/r0755008/Desktop/mri_data/DIFFUSION/ASD_VS_PT.txt -o tractometry_result_ASD_VS_PT.png 
+
+
+#todo: install the following
+# - FSL
+# - Ants (needed for dwibiascorrect)
+# - mrtrix
+# - tractseg
+#
+
+
+#todo: your data needs to be in the following folder structure:
+# For each subject you need a folder "<data_path>/<subject_id>containing the following files:
+#   front.nii
+#   front.bval
+#   front.bvec
+
+#todo you need to be familiar with the tractseg commands to do that read the documentation on the github page https://github.com/MIC-DKFZ/TractSeg
+
+#todo: set path to your data (the folder you specify here must contain one folder for each subject)
+data_path=/Users/r0755008/Desktop/preprocessingexample
+
+#todo: list of all subject IDs (give the name of the maps of the participants, use a space between subejcts)
+subjects=(PT009)
+for i in "${subjects[@]}"
+do
+    echo "processing" $i
+    preprocessing_pipeline $i
+done
